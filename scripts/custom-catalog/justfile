@@ -37,6 +37,8 @@ help:
     @echo "  --bundle-branch       BUNDLE_BRANCH (bundle repo git branch, e.g., release-2.16)"
     @echo "  --base-catalog-tag    BASE_CATALOG_TAG (base catalog image tag, e.g., latest-2.16)"
     @echo "  --image-tag           IMAGE_TAG (tag for your custom images)"
+    @echo "  --csv-version         CSV_VERSION (new CSV version for upgrades)"
+    @echo "  --upgrade-from-csv    CSV to replace (base head, or its predecessor to replace the head)"
     @echo "  --operator-branch     OPERATOR_BRANCH (operator repo git branch, default: main)"
     @echo "  --operator-repo       OPERATOR_REPO (custom operator fork URL)"
     @echo "  --bundle-repo         BUNDLE_REPO (custom bundle fork URL)"
@@ -52,6 +54,7 @@ help:
 [arg("use_https", long="use-https", value="true")]
 clone-operator BRANCH="main" mode="MCH" operator_repo="" use_https="false":
     #!/usr/bin/env bash
+    set -e
 
     # Determine operator directory based on mode
     if [ "{{mode}}" == "MCE" ]; then
@@ -89,8 +92,19 @@ clone-operator BRANCH="main" mode="MCH" operator_repo="" use_https="false":
 
     if [ -d "$OPERATOR_PATH" ]; then
         echo "Repository already exists at $OPERATOR_PATH"
-        echo "Updating repository..."
-        cd "$OPERATOR_PATH" && git fetch origin && git checkout {{BRANCH}} && git pull
+        if [ -n "$(git -C "$OPERATOR_PATH" status --porcelain)" ]; then
+            CURRENT_BRANCH=$(git -C "$OPERATOR_PATH" branch --show-current)
+            if [ "$CURRENT_BRANCH" != "{{BRANCH}}" ]; then
+                echo "Error: $OPERATOR_PATH is on $CURRENT_BRANCH with local changes." >&2
+                echo "Preserve or stash them before switching to {{BRANCH}}." >&2
+                git -C "$OPERATOR_PATH" status --short >&2
+                exit 1
+            fi
+            echo "Keeping local generated changes on {{BRANCH}}; skipping fetch and pull."
+        else
+            echo "Updating repository..."
+            cd "$OPERATOR_PATH" && git fetch origin && git checkout {{BRANCH}} && git pull --ff-only
+        fi
     else
         echo "Cloning operator repository..."
         cd {{justfile_directory()}} && git clone -b {{BRANCH}} "$OPERATOR_REPO" "$OPERATOR_DIR"
@@ -285,7 +299,7 @@ operator-build IMG BRANCH="main" mode="MCH" operator_repo="" use_https="false": 
         OPERATOR_DIR="multiclusterhub-operator"
     fi
 
-    podman build --no-cache -t {{IMG}} {{justfile_directory()}}/$OPERATOR_DIR
+    podman build --platform "${TARGET_PLATFORM:-linux/amd64}" --no-cache -t {{IMG}} {{justfile_directory()}}/$OPERATOR_DIR
 
 # Push Operator image
 [arg("IMG", long="img")]
@@ -300,6 +314,7 @@ operator-push IMG:
 [arg("use_https", long="use-https", value="true")]
 operator-build-and-push IMG BRANCH="main" mode="MCH" operator_repo="" use_https="false":
     #!/usr/bin/env bash
+    set -e
     HTTPS_FLAG=""
     if [ "{{use_https}}" == "true" ]; then
         HTTPS_FLAG="--use-https"
@@ -316,8 +331,22 @@ operator-build-and-push IMG BRANCH="main" mode="MCH" operator_repo="" use_https=
 [arg("bundle_repo", long="bundle-repo")]
 [arg("use_https", long="use-https", value="true")]
 [arg("additional_images", long="additional-images")]
-bundle-build OPERATOR_IMAGE BUNDLE_IMAGE BRANCH="release-2.16" DISPLAY_NAME="Custom Catalog" mode="MCH" bundle_repo="" use_https="false" additional_images="":
+[arg("csv_version", long="csv-version")]
+[arg("upgrade_from_csv", long="upgrade-from-csv")]
+bundle-build OPERATOR_IMAGE BUNDLE_IMAGE BRANCH="release-2.16" DISPLAY_NAME="Custom Catalog" mode="MCH" bundle_repo="" use_https="false" additional_images="" csv_version="" upgrade_from_csv="":
     #!/usr/bin/env bash
+    set -e
+
+    CSV_VERSION="{{csv_version}}"
+    UPGRADE_FROM_CSV="{{upgrade_from_csv}}"
+    if [ -n "$UPGRADE_FROM_CSV" ] && [ -z "$CSV_VERSION" ]; then
+        echo "Error: --csv-version is required with --upgrade-from-csv." >&2
+        exit 1
+    fi
+    if [ -n "$CSV_VERSION" ] && [[ ! "$CSV_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9a-z-]+(\.[0-9a-z-]+)*)?$ ]]; then
+        echo "Error: --csv-version must be a lowercase semantic version without build metadata." >&2
+        exit 1
+    fi
 
     # temp dir
     TMPDIR=$(mktemp -d)
@@ -326,9 +355,11 @@ bundle-build OPERATOR_IMAGE BUNDLE_IMAGE BRANCH="release-2.16" DISPLAY_NAME="Cus
     if [ "{{mode}}" == "MCE" ]; then
         BUNDLE_DIR="mce-operator-bundle"
         CSV_PATTERN="multicluster-engine.v"
+        CSV_PREFIX="multicluster-engine"
     else
         BUNDLE_DIR="acm-operator-bundle"
         CSV_PATTERN="advanced-cluster-management.v"
+        CSV_PREFIX="advanced-cluster-management"
     fi
 
     # Determine bundle repo URL
@@ -359,6 +390,27 @@ bundle-build OPERATOR_IMAGE BUNDLE_IMAGE BRANCH="release-2.16" DISPLAY_NAME="Cus
     OPERATOR_IMAGE="{{OPERATOR_IMAGE}}"
     OPERATOR_IMAGE_WITH_PORT="${OPERATOR_IMAGE//quay.io/quay.io:443}"
 
+    if [ -n "$CSV_VERSION" ]; then
+        NEW_CSV_NAME="${CSV_PREFIX}.v${CSV_VERSION}"
+        if [ "$NEW_CSV_NAME" == "$UPGRADE_FROM_CSV" ]; then
+            echo "Error: the new CSV name must differ from --upgrade-from-csv." >&2
+            exit 1
+        fi
+        echo "ℹ️  Setting CSV name to $NEW_CSV_NAME and version to $CSV_VERSION"
+        export NEW_CSV_NAME CSV_VERSION
+        yq -i '.metadata.name = strenv(NEW_CSV_NAME) | .spec.version = strenv(CSV_VERSION)' "$CSV_FILE"
+        NEW_CSV_FILE="$(dirname "$CSV_FILE")/$NEW_CSV_NAME.clusterserviceversion.yaml"
+        if [ "$CSV_FILE" != "$NEW_CSV_FILE" ]; then
+            mv "$CSV_FILE" "$NEW_CSV_FILE"
+            CSV_FILE="$NEW_CSV_FILE"
+        fi
+    fi
+    if [ -n "$UPGRADE_FROM_CSV" ]; then
+        echo "ℹ️  Setting CSV spec.replaces to $UPGRADE_FROM_CSV"
+        export UPGRADE_FROM_CSV
+        yq -i '.spec.replaces = strenv(UPGRADE_FROM_CSV)' "$CSV_FILE"
+    fi
+
     # replace the CSV operator image with the specified one
     echo "ℹ️  Replacing operator image in CSV with $OPERATOR_IMAGE_WITH_PORT"
     yq -i '.spec.install.spec.deployments[0].spec.template.spec.containers[0].image = "'"$OPERATOR_IMAGE_WITH_PORT"'"' "$CSV_FILE"
@@ -376,7 +428,7 @@ bundle-build OPERATOR_IMAGE BUNDLE_IMAGE BRANCH="release-2.16" DISPLAY_NAME="Cus
             yq -i "(.spec.relatedImages[] | select(.name == \"$image_key\") | .image) = \"$image_value_with_port\"" "$CSV_FILE"
 
             # Replace in deployment env vars (OPERAND_IMAGE_* pattern)
-            env_var_name="OPERAND_IMAGE_${image_key^^}"
+            env_var_name="OPERAND_IMAGE_$(printf '%s' "$image_key" | tr '[:lower:]' '[:upper:]')"
             echo "ℹ️  Replacing env var $env_var_name with $image_value_with_port"
             yq -i "(.spec.install.spec.deployments[].spec.template.spec.containers[].env[] | select(.name == \"$env_var_name\") | .value) = \"$image_value_with_port\"" "$CSV_FILE"
         done
@@ -390,7 +442,7 @@ bundle-build OPERATOR_IMAGE BUNDLE_IMAGE BRANCH="release-2.16" DISPLAY_NAME="Cus
     operator-sdk bundle validate "$TMPDIR/$BUNDLE_DIR"
 
     echo "Building Bundle Image"
-    podman build -t {{BUNDLE_IMAGE}} "$TMPDIR/$BUNDLE_DIR"
+    podman build --platform "${TARGET_PLATFORM:-linux/amd64}" -t {{BUNDLE_IMAGE}} "$TMPDIR/$BUNDLE_DIR"
 
 #
 
@@ -408,8 +460,11 @@ bundle-push BUNDLE_IMAGE: _check-quay-login
 [arg("bundle_repo", long="bundle-repo")]
 [arg("use_https", long="use-https", value="true")]
 [arg("additional_images", long="additional-images")]
-bundle-build-and-push OPERATOR_IMAGE BUNDLE_IMAGE BRANCH="release-2.16" DISPLAY_NAME="" mode="MCH" bundle_repo="" use_https="false" additional_images="":
+[arg("csv_version", long="csv-version")]
+[arg("upgrade_from_csv", long="upgrade-from-csv")]
+bundle-build-and-push OPERATOR_IMAGE BUNDLE_IMAGE BRANCH="release-2.16" DISPLAY_NAME="" mode="MCH" bundle_repo="" use_https="false" additional_images="" csv_version="" upgrade_from_csv="":
     #!/usr/bin/env bash
+    set -e
     # Set default display name based on mode if not provided
     if [ -z "{{DISPLAY_NAME}}" ]; then
         if [ "{{mode}}" == "MCE" ]; then
@@ -426,12 +481,20 @@ bundle-build-and-push OPERATOR_IMAGE BUNDLE_IMAGE BRANCH="release-2.16" DISPLAY_
         HTTPS_FLAG="--use-https"
     fi
 
-    ADDITIONAL_IMAGES_FLAG=""
+    ADDITIONAL_IMAGES_FLAGS=()
     if [ -n "{{additional_images}}" ]; then
-        ADDITIONAL_IMAGES_FLAG="--additional-images \"{{additional_images}}\""
+        ADDITIONAL_IMAGES_FLAGS+=(--additional-images "{{additional_images}}")
     fi
 
-    just bundle-build --operator-image "{{OPERATOR_IMAGE}}" --bundle-image "{{BUNDLE_IMAGE}}" --branch "{{BRANCH}}" --display-name "$DISPLAY_NAME" --mode {{mode}} --bundle-repo "{{bundle_repo}}" $HTTPS_FLAG $ADDITIONAL_IMAGES_FLAG
+    UPGRADE_FLAGS=()
+    if [ -n "{{csv_version}}" ]; then
+        UPGRADE_FLAGS+=(--csv-version "{{csv_version}}")
+    fi
+    if [ -n "{{upgrade_from_csv}}" ]; then
+        UPGRADE_FLAGS+=(--upgrade-from-csv "{{upgrade_from_csv}}")
+    fi
+
+    just bundle-build --operator-image "{{OPERATOR_IMAGE}}" --bundle-image "{{BUNDLE_IMAGE}}" --branch "{{BRANCH}}" --display-name "$DISPLAY_NAME" --mode {{mode}} --bundle-repo "{{bundle_repo}}" $HTTPS_FLAG "${ADDITIONAL_IMAGES_FLAGS[@]}" "${UPGRADE_FLAGS[@]}"
     just bundle-push --bundle-image "{{BUNDLE_IMAGE}}"
 
 
@@ -441,9 +504,12 @@ bundle-build-and-push OPERATOR_IMAGE BUNDLE_IMAGE BRANCH="release-2.16" DISPLAY_
 [arg("CATALOG_IMG", long="catalog-img")]
 [arg("mode", long="mode")]
 [arg("catalog_base", long="catalog-base")]
-catalog-build BASE_CATALOG_TAG BUNDLE_IMG CATALOG_IMG mode="MCH" catalog_base="": _check-quay-login
+[arg("upgrade_from_csv", long="upgrade-from-csv")]
+catalog-build BASE_CATALOG_TAG BUNDLE_IMG CATALOG_IMG mode="MCH" catalog_base="" upgrade_from_csv="": _check-quay-login
     #!/usr/bin/env bash
     set -e
+
+    UPGRADE_FROM_CSV="{{upgrade_from_csv}}"
 
     TMPDIR=$(mktemp -d)
     echo "Temp dir: $TMPDIR"
@@ -479,7 +545,7 @@ catalog-build BASE_CATALOG_TAG BUNDLE_IMG CATALOG_IMG mode="MCH" catalog_base=""
     CHANNELS_FILE="$TMPDIR/$CATALOG_DIR/channels.yaml"
 
     # Determine the channel name based on version
-    CHANNEL_VERSION=$(echo "{{BASE_CATALOG_TAG}}" | grep -oP '\d+\.\d+' | head -1)
+    CHANNEL_VERSION=$(echo "{{BASE_CATALOG_TAG}}" | grep -Eo '[0-9]+\.[0-9]+' | head -1)
     if [ "{{mode}}" == "MCE" ]; then
         CHANNEL_NAME="stable-${CHANNEL_VERSION}"
     else
@@ -495,28 +561,69 @@ catalog-build BASE_CATALOG_TAG BUNDLE_IMG CATALOG_IMG mode="MCH" catalog_base=""
     fi
     echo "Target channel: $CHANNEL_NAME"
 
-    # Get the name of the last bundle in the channel (the one we're replacing)
+    # Get the name of the last bundle in the channel (the base channel head)
     OLD_BUNDLE_NAME=$(yq eval "select(.name == \"$CHANNEL_NAME\") | .entries[-1].name" "$CHANNELS_FILE")
-    if [ -z "$OLD_BUNDLE_NAME" ]; then
+    if [ -z "$OLD_BUNDLE_NAME" ] || [ "$OLD_BUNDLE_NAME" == "null" ]; then
         echo "Error: Could not find channel '$CHANNEL_NAME' (or it has no entries) in $CHANNELS_FILE." >&2
         echo "Available channels: $(yq eval '.name' "$CHANNELS_FILE" | tr '\n' ' ')" >&2
         exit 1
     fi
-    echo "Replacing bundle: $OLD_BUNDLE_NAME"
+    echo "Base channel head: $OLD_BUNDLE_NAME"
+
+    HEAD_REPLACES=$(yq eval "select(.schema == \"olm.channel\" and .name == \"$CHANNEL_NAME\") | .entries[-1].replaces" "$CHANNELS_FILE")
+    UPGRADE_MODE=""
+    if [ -n "$UPGRADE_FROM_CSV" ]; then
+        if [ "$UPGRADE_FROM_CSV" == "$OLD_BUNDLE_NAME" ]; then
+            UPGRADE_MODE="append"
+        elif [ "$UPGRADE_FROM_CSV" == "$HEAD_REPLACES" ]; then
+            UPGRADE_MODE="replace-head"
+        else
+            echo "Error: --upgrade-from-csv must match the head of $CHANNEL_NAME ($OLD_BUNDLE_NAME)" >&2
+            echo "or its replaces target ($HEAD_REPLACES)." >&2
+            exit 1
+        fi
+    fi
 
     # Render the new bundle
     NEW_BUNDLE_RENDERED=$(opm render {{BUNDLE_IMG}} -oyaml | yq '(.image, .relatedImages[].image) |= sub("quay.io/", "quay.io:443/")')
     NEW_BUNDLE_NAME=$(echo "$NEW_BUNDLE_RENDERED" | yq eval 'select(.schema == "olm.bundle") | .name')
+    if [ -z "$NEW_BUNDLE_NAME" ] || [ "$NEW_BUNDLE_NAME" == "null" ]; then
+        echo "Error: Could not find an olm.bundle name in {{BUNDLE_IMG}}." >&2
+        exit 1
+    fi
     echo "New bundle name: $NEW_BUNDLE_NAME"
 
-    # Remove the old bundle from bundles.yaml and append the new one
-    yq eval -i "select(.name != \"$OLD_BUNDLE_NAME\" or .schema != \"olm.bundle\")" "$BUNDLES_FILE"
-    echo "---" >> "$BUNDLES_FILE"
-    echo "$NEW_BUNDLE_RENDERED" >> "$BUNDLES_FILE"
+    if [ -n "$UPGRADE_FROM_CSV" ]; then
+        if [ "$NEW_BUNDLE_NAME" == "$OLD_BUNDLE_NAME" ]; then
+            echo "Error: an upgrade needs a CSV name distinct from the base head. Pass a new --csv-version." >&2
+            exit 1
+        fi
+        export NEW_BUNDLE_NAME
+        if [ -n "$(yq eval 'select(.schema == "olm.bundle" and .name == strenv(NEW_BUNDLE_NAME)) | .name' "$BUNDLES_FILE")" ]; then
+            echo "Error: $NEW_BUNDLE_NAME already exists in the base catalog." >&2
+            exit 1
+        fi
+    fi
 
-    # Replace old bundle name in ALL channels that reference it (not just the target channel)
-    # This handles cases where multiple channels (e.g. release-5.0 and stable-5.0) reference the same bundle
-    yq eval -i "(select(.schema == \"olm.channel\") | .entries[] | select(.name == \"$OLD_BUNDLE_NAME\")).name = \"$NEW_BUNDLE_NAME\"" "$CHANNELS_FILE"
+    if [ "$UPGRADE_MODE" == "append" ]; then
+        export NEW_BUNDLE_NAME UPGRADE_FROM_CSV CHANNEL_NAME
+        echo "Appending $NEW_BUNDLE_NAME to $CHANNEL_NAME; replaces $UPGRADE_FROM_CSV"
+        echo "---" >> "$BUNDLES_FILE"
+        echo "$NEW_BUNDLE_RENDERED" >> "$BUNDLES_FILE"
+        yq eval -i '(select(.schema == "olm.channel" and .name == strenv(CHANNEL_NAME)) | .entries) += [{"name": strenv(NEW_BUNDLE_NAME), "replaces": strenv(UPGRADE_FROM_CSV)}]' "$CHANNELS_FILE"
+    else
+        # Replacing the head keeps its existing channel edge, including the
+        # direct upgrade from HEAD_REPLACES when --upgrade-from-csv names it.
+        if [ "$UPGRADE_MODE" == "replace-head" ]; then
+            echo "Replacing $OLD_BUNDLE_NAME with $NEW_BUNDLE_NAME; preserves replaces $UPGRADE_FROM_CSV"
+        fi
+        yq eval -i "select(.name != \"$OLD_BUNDLE_NAME\" or .schema != \"olm.bundle\")" "$BUNDLES_FILE"
+        echo "---" >> "$BUNDLES_FILE"
+        echo "$NEW_BUNDLE_RENDERED" >> "$BUNDLES_FILE"
+
+        # Update all channels that reference the replaced bundle.
+        yq eval -i "(select(.schema == \"olm.channel\") | .entries[] | select(.name == \"$OLD_BUNDLE_NAME\")).name = \"$NEW_BUNDLE_NAME\"" "$CHANNELS_FILE"
+    fi
 
     echo "Validating Catalog"
     opm validate "$TMPDIR/$CATALOG_DIR"
@@ -525,7 +632,7 @@ catalog-build BASE_CATALOG_TAG BUNDLE_IMG CATALOG_IMG mode="MCH" catalog_base=""
     opm generate dockerfile "$TMPDIR/$CATALOG_DIR"
 
     echo "Building Catalog Image"
-    podman build -f "$TMPDIR/$CATALOG_DIR.Dockerfile" -t {{CATALOG_IMG}} "$TMPDIR"
+    podman build --platform "${TARGET_PLATFORM:-linux/amd64}" -f "$TMPDIR/$CATALOG_DIR.Dockerfile" -t {{CATALOG_IMG}} "$TMPDIR"
 
 #
 
@@ -538,8 +645,15 @@ catalog-push CATALOG_IMG: _check-quay-login
 [arg("CATALOG_IMG", long="catalog-img")]
 [arg("mode", long="mode")]
 [arg("catalog_base", long="catalog-base")]
-catalog-build-and-push BASE_CATALOG_TAG BUNDLE_IMG CATALOG_IMG mode="MCH" catalog_base="":
-    just catalog-build --base-catalog-tag "{{BASE_CATALOG_TAG}}" --bundle-img "{{BUNDLE_IMG}}" --catalog-img "{{CATALOG_IMG}}" --mode {{mode}} --catalog-base "{{catalog_base}}"
+[arg("upgrade_from_csv", long="upgrade-from-csv")]
+catalog-build-and-push BASE_CATALOG_TAG BUNDLE_IMG CATALOG_IMG mode="MCH" catalog_base="" upgrade_from_csv="":
+    #!/usr/bin/env bash
+    set -e
+    UPGRADE_FLAGS=()
+    if [ -n "{{upgrade_from_csv}}" ]; then
+        UPGRADE_FLAGS+=(--upgrade-from-csv "{{upgrade_from_csv}}")
+    fi
+    just catalog-build --base-catalog-tag "{{BASE_CATALOG_TAG}}" --bundle-img "{{BUNDLE_IMG}}" --catalog-img "{{CATALOG_IMG}}" --mode {{mode}} --catalog-base "{{catalog_base}}" "${UPGRADE_FLAGS[@]}"
     just catalog-push --catalog-img "{{CATALOG_IMG}}"
 
 # End-to-end build operator, bundle, and catalog
@@ -554,8 +668,15 @@ catalog-build-and-push BASE_CATALOG_TAG BUNDLE_IMG CATALOG_IMG mode="MCH" catalo
 [arg("catalog_base", long="catalog-base")]
 [arg("use_https", long="use-https", value="true")]
 [arg("additional_images", long="additional-images")]
-e2e-catalog USERNAME BUNDLE_BRANCH BASE_CATALOG_TAG IMAGE_TAG OPERATOR_BRANCH="main" mode="MCH" operator_repo="" bundle_repo="" catalog_base="" use_https="false" additional_images="":
+[arg("csv_version", long="csv-version")]
+[arg("upgrade_from_csv", long="upgrade-from-csv")]
+e2e-catalog USERNAME BUNDLE_BRANCH BASE_CATALOG_TAG IMAGE_TAG OPERATOR_BRANCH="main" mode="MCH" operator_repo="" bundle_repo="" catalog_base="" use_https="false" additional_images="" csv_version="" upgrade_from_csv="":
     #!/usr/bin/env bash
+    set -e
+    if [ -n "{{upgrade_from_csv}}" ] && [ -z "{{csv_version}}" ]; then
+        echo "Error: --csv-version is required with --upgrade-from-csv." >&2
+        exit 1
+    fi
     echo "Mode: {{mode}}"
 
     # Determine operator directory based on mode
@@ -581,14 +702,24 @@ e2e-catalog USERNAME BUNDLE_BRANCH BASE_CATALOG_TAG IMAGE_TAG OPERATOR_BRANCH="m
         HTTPS_FLAG="--use-https"
     fi
 
-    ADDITIONAL_IMAGES_FLAG=""
+    ADDITIONAL_IMAGES_FLAGS=()
     if [ -n "{{additional_images}}" ]; then
-        ADDITIONAL_IMAGES_FLAG="--additional-images \"{{additional_images}}\""
+        ADDITIONAL_IMAGES_FLAGS+=(--additional-images "{{additional_images}}")
+    fi
+
+    BUNDLE_UPGRADE_FLAGS=()
+    CATALOG_UPGRADE_FLAGS=()
+    if [ -n "{{csv_version}}" ]; then
+        BUNDLE_UPGRADE_FLAGS+=(--csv-version "{{csv_version}}")
+    fi
+    if [ -n "{{upgrade_from_csv}}" ]; then
+        BUNDLE_UPGRADE_FLAGS+=(--upgrade-from-csv "{{upgrade_from_csv}}")
+        CATALOG_UPGRADE_FLAGS+=(--upgrade-from-csv "{{upgrade_from_csv}}")
     fi
 
     just operator-build-and-push --img "$OPERATOR_IMAGE" --branch "{{OPERATOR_BRANCH}}" --mode {{mode}} --operator-repo "{{operator_repo}}" $HTTPS_FLAG
-    just bundle-build-and-push --operator-image "$OPERATOR_IMAGE" --bundle-image "$BUNDLE_IMAGE" --branch "{{BUNDLE_BRANCH}}" --mode {{mode}} --bundle-repo "{{bundle_repo}}" $HTTPS_FLAG $ADDITIONAL_IMAGES_FLAG
-    just catalog-build-and-push --base-catalog-tag "{{BASE_CATALOG_TAG}}" --bundle-img "$BUNDLE_IMAGE" --catalog-img "$CATALOG_IMAGE" --mode {{mode}} --catalog-base "{{catalog_base}}"
+    just bundle-build-and-push --operator-image "$OPERATOR_IMAGE" --bundle-image "$BUNDLE_IMAGE" --branch "{{BUNDLE_BRANCH}}" --mode {{mode}} --bundle-repo "{{bundle_repo}}" $HTTPS_FLAG "${ADDITIONAL_IMAGES_FLAGS[@]}" "${BUNDLE_UPGRADE_FLAGS[@]}"
+    just catalog-build-and-push --base-catalog-tag "{{BASE_CATALOG_TAG}}" --bundle-img "$BUNDLE_IMAGE" --catalog-img "$CATALOG_IMAGE" --mode {{mode}} --catalog-base "{{catalog_base}}" "${CATALOG_UPGRADE_FLAGS[@]}"
 
     # Uncomment to clean up cloned repository after build:
     # just cleanup-operator --mode {{mode}}
@@ -623,9 +754,16 @@ e2e-catalog USERNAME BUNDLE_BRANCH BASE_CATALOG_TAG IMAGE_TAG OPERATOR_BRANCH="m
 [arg("catalog_base", long="catalog-base")]
 [arg("use_https", long="use-https", value="true")]
 [arg("additional_images", long="additional-images")]
-dev-branch-e2e USERNAME BUNDLE_BRANCH BASE_CATALOG_TAG IMAGE_TAG OPERATOR_BRANCH="main" COMPONENT_BRANCHES="" COMPONENT_FORKS="" ORG="stolostron" REPO="installer-dev-tools" BRANCH="main" PIPELINE_REPO="pipeline" PIPELINE_BRANCH="2.17-integration" mode="MCH" operator_repo="" bundle_repo="" catalog_base="" use_https="false" additional_images="": (clone-operator OPERATOR_BRANCH mode operator_repo use_https)
+[arg("csv_version", long="csv-version")]
+[arg("upgrade_from_csv", long="upgrade-from-csv")]
+dev-branch-e2e USERNAME BUNDLE_BRANCH BASE_CATALOG_TAG IMAGE_TAG OPERATOR_BRANCH="main" COMPONENT_BRANCHES="" COMPONENT_FORKS="" ORG="stolostron" REPO="installer-dev-tools" BRANCH="main" PIPELINE_REPO="pipeline" PIPELINE_BRANCH="2.17-integration" mode="MCH" operator_repo="" bundle_repo="" catalog_base="" use_https="false" additional_images="" csv_version="" upgrade_from_csv="": (clone-operator OPERATOR_BRANCH mode operator_repo use_https)
     #!/usr/bin/env bash
     set -e
+
+    if [ -n "{{upgrade_from_csv}}" ] && [ -z "{{csv_version}}" ]; then
+        echo "Error: --csv-version is required with --upgrade-from-csv." >&2
+        exit 1
+    fi
 
     # Determine operator directory based on mode
     if [ "{{mode}}" == "MCE" ]; then
@@ -653,24 +791,27 @@ dev-branch-e2e USERNAME BUNDLE_BRANCH BASE_CATALOG_TAG IMAGE_TAG OPERATOR_BRANCH
     fi
     .venv/bin/pip install -q -r hack/bundle-automation/requirements.txt 2>/dev/null || true
 
-    # Build component-branch arguments
-    COMPONENT_ARGS=""
-    if [ -n "{{COMPONENT_BRANCHES}}" ]; then
-        echo "Component branch overrides: {{COMPONENT_BRANCHES}}"
-        for override in {{COMPONENT_BRANCHES}}; do
-            COMPONENT_ARGS="$COMPONENT_ARGS --component-branch $override"
-        done
-    fi
-
-    # Build component-fork arguments
-    if [ -n "{{COMPONENT_FORKS}}" ]; then
-        echo "Component fork overrides: {{COMPONENT_FORKS}}"
-        for override in {{COMPONENT_FORKS}}; do
-            COMPONENT_ARGS="$COMPONENT_ARGS --component-fork $override"
-        done
-    fi
-
     source .venv/bin/activate
+
+    # release-2.17's generate-shell.py accepts --config, but does not forward
+    # --component-branch/--component-fork. Prepare temporary configs with the
+    # overrides, keeping the release branch name for chart transformations.
+    OVERRIDE_DIR=$(mktemp -d)
+    trap 'rm -rf "$OVERRIDE_DIR"' EXIT
+    CHART_CONFIG="$OVERRIDE_DIR/charts-config.yaml"
+    BUNDLE_CONFIG="$OVERRIDE_DIR/config.yaml"
+    python3 "{{justfile_directory()}}/prepare-component-overrides.py" \
+        --config "$(pwd)/hack/bundle-automation/charts-config.yaml" \
+        --output "$CHART_CONFIG" \
+        --mirror-dir "$OVERRIDE_DIR/mirrors" \
+        --component-branches "{{COMPONENT_BRANCHES}}" \
+        --component-forks "{{COMPONENT_FORKS}}"
+    python3 "{{justfile_directory()}}/prepare-component-overrides.py" \
+        --config "$(pwd)/hack/bundle-automation/config.yaml" \
+        --output "$BUNDLE_CONFIG" \
+        --mirror-dir "$OVERRIDE_DIR/mirrors" \
+        --component-branches "{{COMPONENT_BRANCHES}}" \
+        --component-forks "{{COMPONENT_FORKS}}"
 
     # Regenerate chart-sourced components (driven by charts-config.yaml)
     echo "ℹ️  Regenerating chart-sourced components (charts-config.yaml)"
@@ -681,7 +822,7 @@ dev-branch-e2e USERNAME BUNDLE_BRANCH BASE_CATALOG_TAG IMAGE_TAG OPERATOR_BRANCH
         --branch {{BRANCH}} \
         --pipeline-repo {{PIPELINE_REPO}} \
         --pipeline-branch {{PIPELINE_BRANCH}} \
-        $COMPONENT_ARGS
+        --config "$CHART_CONFIG"
 
     # Regenerate bundle-sourced components (driven by config.yaml), so that
     # component-branch/component-fork overrides also apply to components whose
@@ -694,7 +835,7 @@ dev-branch-e2e USERNAME BUNDLE_BRANCH BASE_CATALOG_TAG IMAGE_TAG OPERATOR_BRANCH
         --branch {{BRANCH}} \
         --pipeline-repo {{PIPELINE_REPO}} \
         --pipeline-branch {{PIPELINE_BRANCH}} \
-        $COMPONENT_ARGS
+        --config "$BUNDLE_CONFIG"
 
     # Return to justfile directory
     cd {{justfile_directory()}}
@@ -720,9 +861,19 @@ dev-branch-e2e USERNAME BUNDLE_BRANCH BASE_CATALOG_TAG IMAGE_TAG OPERATOR_BRANCH
         HTTPS_FLAG="--use-https"
     fi
 
-    ADDITIONAL_IMAGES_FLAG=""
+    ADDITIONAL_IMAGES_FLAGS=()
     if [ -n "{{additional_images}}" ]; then
-        ADDITIONAL_IMAGES_FLAG="--additional-images \"{{additional_images}}\""
+        ADDITIONAL_IMAGES_FLAGS+=(--additional-images "{{additional_images}}")
+    fi
+
+    BUNDLE_UPGRADE_FLAGS=()
+    CATALOG_UPGRADE_FLAGS=()
+    if [ -n "{{csv_version}}" ]; then
+        BUNDLE_UPGRADE_FLAGS+=(--csv-version "{{csv_version}}")
+    fi
+    if [ -n "{{upgrade_from_csv}}" ]; then
+        BUNDLE_UPGRADE_FLAGS+=(--upgrade-from-csv "{{upgrade_from_csv}}")
+        CATALOG_UPGRADE_FLAGS+=(--upgrade-from-csv "{{upgrade_from_csv}}")
     fi
 
     just operator-build-and-push --img "$OPERATOR_IMAGE" --branch "{{OPERATOR_BRANCH}}" --mode {{mode}} --operator-repo "{{operator_repo}}" $HTTPS_FLAG
@@ -733,7 +884,7 @@ dev-branch-e2e USERNAME BUNDLE_BRANCH BASE_CATALOG_TAG IMAGE_TAG OPERATOR_BRANCH
     echo "========================================="
 
     # Build and push the bundle
-    just bundle-build-and-push --operator-image "$OPERATOR_IMAGE" --bundle-image "$BUNDLE_IMAGE" --branch "{{BUNDLE_BRANCH}}" --mode {{mode}} --bundle-repo "{{bundle_repo}}" $HTTPS_FLAG $ADDITIONAL_IMAGES_FLAG
+    just bundle-build-and-push --operator-image "$OPERATOR_IMAGE" --bundle-image "$BUNDLE_IMAGE" --branch "{{BUNDLE_BRANCH}}" --mode {{mode}} --bundle-repo "{{bundle_repo}}" $HTTPS_FLAG "${ADDITIONAL_IMAGES_FLAGS[@]}" "${BUNDLE_UPGRADE_FLAGS[@]}"
 
     echo ""
     echo "========================================="
@@ -741,7 +892,7 @@ dev-branch-e2e USERNAME BUNDLE_BRANCH BASE_CATALOG_TAG IMAGE_TAG OPERATOR_BRANCH
     echo "========================================="
 
     # Build and push the catalog
-    just catalog-build-and-push --base-catalog-tag "{{BASE_CATALOG_TAG}}" --bundle-img "$BUNDLE_IMAGE" --catalog-img "$CATALOG_IMAGE" --mode {{mode}} --catalog-base "{{catalog_base}}"
+    just catalog-build-and-push --base-catalog-tag "{{BASE_CATALOG_TAG}}" --bundle-img "$BUNDLE_IMAGE" --catalog-img "$CATALOG_IMAGE" --mode {{mode}} --catalog-base "{{catalog_base}}" "${CATALOG_UPGRADE_FLAGS[@]}"
 
     # Uncomment to clean up cloned repository after build:
     # just cleanup-operator --mode {{mode}}

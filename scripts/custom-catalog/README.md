@@ -16,6 +16,11 @@ development.
 - SSH access to `github.com/stolostron` repos (default clone protocol), or pass
   `--use-https` to clone over HTTPS instead
 
+The three image builds target `linux/amd64` by default, including when Podman
+runs on an Apple Silicon Mac. Set `TARGET_PLATFORM` to another Podman platform
+if the destination cluster uses a different architecture. Check the cluster
+with `oc get nodes -o 'custom-columns=NAME:.metadata.name,ARCH:.status.nodeInfo.architecture'`.
+
 ## Quick Start
 
 Show built-in help and usage examples:
@@ -95,6 +100,14 @@ set of flags without building anything.
 | `clone-operator` | Clone the operator repo (or update it if already cloned) | `--branch`, `--mode`, `--operator-repo`, `--use-https` |
 | `cleanup-operator` | Remove the cloned operator directory | `--mode` |
 
+For `dev-branch-e2e`, `--branch` selects the installer-dev-tools generator
+branch (default `main`). The chart regeneration operations do not use
+`--pipeline-branch`; that flag belongs to other generator operations that read
+the separate pipeline repository. `--operator-branch` and `--bundle-branch`
+select the ACM operator and bundle sources. Component overrides are applied
+through temporary config files because the release-2.17 operator's generator
+wrapper does not accept component override flags directly.
+
 ### Operator image
 
 | Recipe | Purpose | Key flags |
@@ -107,7 +120,7 @@ set of flags without building anything.
 
 | Recipe | Purpose | Key flags |
 |---|---|---|
-| `bundle-build` | Clone the bundle repo, patch the CSV's operator image (and optionally related/operand images), set display name, validate, and build the bundle image | `--operator-image`, `--bundle-image`, `--branch` (default `release-2.16`), `--display-name`, `--mode`, `--bundle-repo`, `--use-https`, `--additional-images` |
+| `bundle-build` | Clone the bundle repo, patch the CSV's operator image (and optionally related/operand images), set display name, optionally set a new CSV version and `spec.replaces`, validate, and build the bundle image | `--operator-image`, `--bundle-image`, `--branch` (default `release-2.16`), `--display-name`, `--mode`, `--bundle-repo`, `--use-https`, `--additional-images`, `--csv-version`, `--upgrade-from-csv` |
 | `bundle-push` | Push a built bundle image (requires quay.io login) | `--bundle-image` |
 | `bundle-build-and-push` | `bundle-build` + `bundle-push`, with a mode-based default display name | same as `bundle-build` |
 
@@ -115,7 +128,7 @@ set of flags without building anything.
 
 | Recipe | Purpose | Key flags |
 |---|---|---|
-| `catalog-build` | Pull the base catalog, replace the last bundle in the release/stable channel with the new one (updating all channels that reference it), validate, and build the catalog image | `--base-catalog-tag`, `--bundle-img`, `--catalog-img`, `--mode`, `--catalog-base` |
+| `catalog-build` | Pull the base catalog and validate/build a custom catalog. By default, replace the last bundle in the release/stable channel; with `--upgrade-from-csv`, append after the head or replace the head while preserving its upgrade edge | `--base-catalog-tag`, `--bundle-img`, `--catalog-img`, `--mode`, `--catalog-base`, `--upgrade-from-csv` |
 | `catalog-push` | Push a built catalog image (requires quay.io login) | `--catalog-img` |
 | `catalog-build-and-push` | `catalog-build` + `catalog-push` | same as `catalog-build` |
 
@@ -135,6 +148,8 @@ set of flags without building anything.
 | `--bundle-branch` | `e2e-catalog`, `dev-branch-e2e` | — | Bundle repo git branch (e.g. `release-2.16`) |
 | `--base-catalog-tag` | `e2e-catalog`, `dev-branch-e2e`, `catalog-build*` | — | Base catalog image tag (e.g. `latest-2.16`) |
 | `--image-tag` | `e2e-catalog`, `dev-branch-e2e` | — | Tag applied to all built images |
+| `--csv-version` | bundle/e2e recipes | — | New lowercase semantic CSV version, for example `5.0.1-managedlogstore.1`; also changes the CSV name |
+| `--upgrade-from-csv` | bundle/catalog/e2e recipes | — | CSV the new bundle replaces: either the base channel head or its `replaces` target. Requires `--csv-version` in bundle/e2e recipes |
 | `--operator-branch` | `e2e-catalog`, `dev-branch-e2e`, `clone-operator`, `operator-build*` | `main` | Operator repo git branch |
 | `--operator-repo` | most recipes | mode default | Custom operator fork/repo URL |
 | `--bundle-repo` | bundle/e2e recipes | mode default | Custom bundle fork/repo URL |
@@ -187,6 +202,47 @@ just dev-branch-e2e --username myuser --bundle-branch release-2.16 \
   --component-branches "search-operator:my-branch observability:feature-x"
 ```
 
+### Build an Upgrade from a Base Catalog
+
+Use a new CSV version when testing an upgrade. An image tag alone does not change
+the CSV identity. To append after the base catalog's channel head, pass that
+head's CSV name to `--upgrade-from-csv`:
+
+```bash
+BASE_HEAD_CSV=$(opm render quay.io/acm-d/acm-dev-catalog:latest-5.0 -o yaml |
+  yq -r 'select(.schema == "olm.channel" and .name == "stable-5.0") | .entries[-1].name')
+
+just dev-branch-e2e --username myuser \
+  --operator-branch release-5.0 --bundle-branch release-5.0 \
+  --base-catalog-tag latest-5.0 --pipeline-branch 5.0-integration \
+  --component-branches 'multicluster-observability-operator:main' \
+  --image-tag managed-logstore-test-50 --use-https \
+  --csv-version 5.0.1-managedlogstore.1 \
+  --upgrade-from-csv "$BASE_HEAD_CSV"
+```
+
+Choose a version newer than the base catalog's channel head. This mode keeps
+the base bundle and adds the new bundle with a `replaces` edge.
+
+If the cluster has the base head's predecessor installed, pass that installed
+CSV to `--upgrade-from-csv` instead. The tool replaces the base head's bundle
+and channel entry, preserving its edge from the installed CSV. For example, if
+`latest-2.17` ends at `advanced-cluster-management.v2.17.4`, whose entry
+replaces `advanced-cluster-management.v2.17.3`, use a distinct custom version:
+
+```bash
+just dev-branch-e2e --username myuser \
+  --operator-branch release-2.17 --bundle-branch release-2.17 \
+  --base-catalog-tag latest-2.17 --pipeline-branch 2.17-integration \
+  --image-tag managed-logstore-test-217 --use-https \
+  --csv-version 2.17.4-managedlogstore.1 \
+  --upgrade-from-csv advanced-cluster-management.v2.17.3
+```
+
+Both modes set `spec.replaces` in the bundle CSV. OLM uses the catalog channel
+edge for upgrades. The cluster Subscription's catalog source and channel are a
+separate deployment step.
+
 ### Iterating on Changes
 
 When testing multiple iterations of a fix, increment your tag:
@@ -207,12 +263,15 @@ just cleanup-operator --mode MCH
 
 - All recipes automatically validate bundles and catalogs before building images
 - The `bundle-build` recipe clones the upstream bundle repository and modifies the CSV
-- The `catalog-build` recipe pulls the base catalog from `quay.io/acm-d` and replaces the
-  last bundle in the target channel, updating **all** channels that reference it
+- By default, `catalog-build` pulls the base catalog from `quay.io/acm-d` and
+  replaces the last bundle in the target channel, updating **all** channels that
+  reference it. Upgrade mode appends to the selected channel when replacing its
+  head, or substitutes the head when replacing its predecessor
 - Images are automatically tagged with `:443` port for quay.io compatibility
 - The cloned operator directory (`multiclusterhub-operator/` or `backplane-operator/`) is
   reused and updated (`git fetch` + `checkout` + `pull`) on subsequent runs rather than
-  re-cloned
+  re-cloned. If it has local changes on a different branch, the recipe stops before
+  building; save those changes with `git stash` or a commit before retrying.
 
 ## Troubleshooting
 
